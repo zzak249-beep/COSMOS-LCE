@@ -74,10 +74,23 @@ class Params:
     fib_ext: float = 1.37
     rr_fixed: float = 2.0
     min_rr: float = 1.0
-    # ejecucion
+    # filtros extra propios (apagados por defecto = comportamiento original del indicador)
+    cooldown_bars: int = 0
+    min_atr_pct: float = 0.0                  # no operar si ATR/precio (%) es menor (mercado muerto)
+    max_cost_r: float = 0.25                  # descarta si los costes ida y vuelta superan esta fraccion del riesgo (0 = off)
+    # gestion (parcial/BE solo en backtest y paper)
+    use_partial: bool = False
+    tp1_r: float = 1.0
+    tp1_pct: float = 50.0
+    use_be: bool = True
     max_bars: int = 0                         # stop por tiempo en velas de 15m (0 = off)
+    # ejecucion y costes
+    entry_mode: str = "next_open"             # backtest: "next_open" (realista) | "close"
     fee_pct: float = 0.05
     slippage_pct: float = 0.03
+    max_spread_pct: float = 0.10              # vivo: no entrar si el spread es mayor
+    max_chase_frac: float = 0.25              # no entrar si el precio ya se alejo esta fraccion del riesgo
+    max_slip_frac: float = 0.35               # vivo: si el slippage del fill supera esto, cierra
 
 
 # ============================================================================
@@ -267,6 +280,7 @@ def compute_signals(c0, c1, c2, p: Params) -> List[Optional[dict]]:
     ref_hi_body_low = ref_lo_body_high = None
     ref_hi_bar = ref_lo_bar = -10 ** 9
     done_bear = done_bull = False
+    last_emit = -10 ** 9
 
     for i in range(n):
         ck = clock(ts[i], p.fri_q4)
@@ -346,6 +360,10 @@ def compute_signals(c0, c1, c2, p: Params) -> List[Optional[dict]]:
         if a is None or q_hi is None or q_lo is None:
             continue
         entry = cl[i]
+        if p.min_atr_pct > 0 and a / entry * 100 < p.min_atr_pct:
+            continue
+        if p.cooldown_bars > 0 and i - last_emit <= p.cooldown_bars:
+            continue
         rng_prev = (p_hi - p_lo) if (p_hi is not None and p_lo is not None) else None
 
         def build(side: str):
@@ -368,12 +386,14 @@ def compute_signals(c0, c1, c2, p: Params) -> List[Optional[dict]]:
         sig = None
         if p.use_short and bear_bias and tc_bear and not done_bear and to_ok_s:
             sl, risk, tp, rr = build("short")
-            if risk > 0 and risk <= p.max_risk_atr * a and rr is not None and rr >= p.min_rr and (not p.req_div or st_bear_dv):
+            if (risk > 0 and risk <= p.max_risk_atr * a and rr is not None and rr >= p.min_rr and (not p.req_div or st_bear_dv)
+                    and (p.max_cost_r <= 0 or 2 * (p.fee_pct + p.slippage_pct) / (risk / entry * 100) <= p.max_cost_r)):
                 sig = dict(side="short", entry=entry, sl=sl, tp=tp, rr=rr)
                 done_bear = True
         elif p.use_long and bull_bias and tc_bull and not done_bull and to_ok_l:
             sl, risk, tp, rr = build("long")
-            if risk > 0 and risk <= p.max_risk_atr * a and rr is not None and rr >= p.min_rr and (not p.req_div or st_bull_dv):
+            if (risk > 0 and risk <= p.max_risk_atr * a and rr is not None and rr >= p.min_rr and (not p.req_div or st_bull_dv)
+                    and (p.max_cost_r <= 0 or 2 * (p.fee_pct + p.slippage_pct) / (risk / entry * 100) <= p.max_cost_r)):
                 sig = dict(side="long", entry=entry, sl=sl, tp=tp, rr=rr)
                 done_bull = True
         if sig:
@@ -383,11 +403,12 @@ def compute_signals(c0, c1, c2, p: Params) -> List[Optional[dict]]:
                              f"SSMT {p.stage_cyc}{'+' + ('Semanal' if stage_d else 'Diario') if p.use2 else ''} | tCISD | "
                              f"True Opens {'descuento ' + str(disc) if sig['side'] == 'long' else 'prima ' + str(prem)}/3"))
             signals[i] = sig
+            last_emit = i
     return signals
 
 
 # ============================================================================
-# Tamano, backtest
+# Tamano, posiciones y backtest
 # ============================================================================
 def position_size(equity, risk_pct, max_lev, entry, sl):
     dist = abs(entry - sl)
@@ -396,36 +417,92 @@ def position_size(equity, risk_pct, max_lev, entry, sl):
     return max(0.0, min(equity * risk_pct / 100.0 / dist, equity * max_lev / entry))
 
 
-def backtest(c0, c1, c2, p: Params, equity0=1000.0, risk_pct=0.5, max_lev=3.0, quiet=False):
-    sigs = compute_signals(c0, c1, c2, p)
-    eq, peak, max_dd, pos, trades = equity0, equity0, 0.0, None, []
+def close_pnl(pos: dict, exit_px: float, fee: float) -> float:
+    dr = 1 if pos["side"] == "long" else -1
+    return (exit_px - pos["entry"]) * dr * pos["qty"] - pos["qty"] * (pos["entry"] + exit_px) * fee
+
+
+def new_position(side, entry_px, sl, tp, qty, risk_cash, ts, i, p: Params) -> dict:
+    dr = 1 if side == "long" else -1
+    risk = abs(entry_px - sl)
+    return dict(side=side, entry=entry_px, sl=sl, tp=tp, tp1=entry_px + dr * risk * p.tp1_r, qty=qty, qty0=qty,
+                risk_cash=risk_cash, ts=ts, i=i, realized=0.0, tp1_done=False)
+
+
+def try_open(side, sig, px, eq, risk_pct, max_lev, p: Params, ts, i) -> Optional[dict]:
+    """Mismos filtros 'no perseguir el precio' que en vivo."""
+    dr = 1 if side == "long" else -1
+    risk = abs(sig["entry"] - sig["sl"])
+    if risk <= 0:
+        return None
+    if (px - sig["entry"]) * dr > p.max_chase_frac * risk:
+        return None
+    if (dr == 1 and not (sig["sl"] < px < sig["tp"])) or (dr == -1 and not (sig["tp"] < px < sig["sl"])):
+        return None
+    qty = position_size(eq, risk_pct, max_lev, px, sig["sl"])
+    if qty <= 0:
+        return None
+    return new_position(side, px, sig["sl"], sig["tp"], qty, eq * risk_pct / 100.0, ts, i, p)
+
+
+def _finish(pos, px, reason, fee):
+    return dict(pnl=pos["realized"] + close_pnl(pos, px, fee), exit=px, reason=reason)
+
+
+def advance(pos: dict, c, bars: int, p: Params) -> Optional[dict]:
+    """Procesa UNA vela de una posicion abierta (orden conservador: SL antes que TP).
+    Devuelve None si sigue abierta o dict(pnl, exit, reason) si se cierra."""
+    ts, o, h, l, cl, v = c
+    dr = 1 if pos["side"] == "long" else -1
     fee, slip = p.fee_pct / 100.0, p.slippage_pct / 100.0
+    if (dr == 1 and l <= pos["sl"]) or (dr == -1 and h >= pos["sl"]):
+        return _finish(pos, pos["sl"] * (1 - slip * dr), "BE" if pos["tp1_done"] and p.use_be else "SL", fee)
+    if p.use_partial and not pos["tp1_done"] and ((dr == 1 and h >= pos["tp1"]) or (dr == -1 and l <= pos["tp1"])):
+        q1 = pos["qty0"] * p.tp1_pct / 100.0
+        pos["realized"] += (pos["tp1"] - pos["entry"]) * dr * q1 - q1 * (pos["entry"] + pos["tp1"]) * fee
+        pos["qty"] -= q1
+        pos["tp1_done"] = True
+        if p.use_be:
+            pos["sl"] = pos["entry"]
+            if (dr == 1 and l <= pos["sl"]) or (dr == -1 and h >= pos["sl"]):    # conservador: toco el BE en la misma vela
+                return _finish(pos, pos["sl"] * (1 - slip * dr), "BE", fee)
+    if (dr == 1 and h >= pos["tp"]) or (dr == -1 and l <= pos["tp"]):
+        return _finish(pos, pos["tp"], "TP", fee)
+    if p.max_bars > 0 and bars >= p.max_bars:
+        return _finish(pos, cl * (1 - slip * dr), "TIME", fee)
+    return None
+
+
+def backtest(c0, c1, c2, p: Params, equity0=1000.0, risk_pct=0.5, max_lev=3.0, quiet=False, sigs=None):
+    if sigs is None:
+        sigs = compute_signals(c0, c1, c2, p)
+    eq, peak, max_dd = equity0, equity0, 0.0
+    pos, pending, trades = None, None, []
+    slip = p.slippage_pct / 100.0
     for i, c in enumerate(c0):
         ts, o, h, l, cl, v = c
-        if pos is not None and i > pos["i"]:
-            dr = 1 if pos["side"] == "long" else -1
-            ex_px = reason = None
-            if (dr == 1 and l <= pos["sl"]) or (dr == -1 and h >= pos["sl"]):
-                ex_px, reason = pos["sl"] * (1 - slip * dr), "SL"
-            elif (dr == 1 and h >= pos["tp"]) or (dr == -1 and l <= pos["tp"]):
-                ex_px, reason = pos["tp"], "TP"
-            elif p.max_bars > 0 and i - pos["i"] >= p.max_bars:
-                ex_px, reason = cl * (1 - slip * dr), "TIME"
-            if ex_px is not None:
-                pnl = (ex_px - pos["entry"]) * dr * pos["qty"] - pos["qty"] * (pos["entry"] + ex_px) * fee
-                eq += pnl
+        if pending is not None:
+            s, pending = pending, None
+            if pos is None:
+                dr = 1 if s["side"] == "long" else -1
+                pos = try_open(s["side"], s, o * (1 + slip * dr), eq, risk_pct, max_lev, p, ts, i)
+        if pos is not None:
+            res = advance(pos, c, i - pos["i"], p)
+            if res:
+                eq += res["pnl"]
                 peak = max(peak, eq)
                 max_dd = max(max_dd, (peak - eq) / peak * 100.0)
-                trades.append(dict(ts=pos["ts"], side=pos["side"], entry=pos["entry"], exit=ex_px, reason=reason,
-                                   pnl=pnl, r=pnl / pos["risk_cash"] if pos["risk_cash"] else 0.0, bars=i - pos["i"]))
+                trades.append(dict(ts=ts, side=pos["side"], entry=pos["entry"], exit=res["exit"], reason=res["reason"],
+                                   pnl=res["pnl"], r=res["pnl"] / pos["risk_cash"] if pos["risk_cash"] else 0.0,
+                                   bars=i - pos["i"]))
                 pos = None
         s = sigs[i]
-        if pos is None and s is not None:
-            dr = 1 if s["side"] == "long" else -1
-            ep = s["entry"] * (1 + slip * dr)
-            qty = position_size(eq, risk_pct, max_lev, ep, s["sl"])
-            if qty > 0:
-                pos = dict(i=i, ts=ts, side=s["side"], entry=ep, sl=s["sl"], tp=s["tp"], qty=qty, risk_cash=eq * risk_pct / 100.0)
+        if pos is None and s is not None and pending is None:
+            if p.entry_mode == "close":
+                dr = 1 if s["side"] == "long" else -1
+                pos = try_open(s["side"], s, s["entry"] * (1 + slip * dr), eq, risk_pct, max_lev, p, ts, i)
+            else:
+                pending = s
     n = len(trades)
     wins = [t for t in trades if t["pnl"] > 0]
     gw = sum(t["pnl"] for t in wins)
@@ -436,6 +513,8 @@ def backtest(c0, c1, c2, p: Params, equity0=1000.0, risk_pct=0.5, max_lev=3.0, q
                avg_r=(sum(t["r"] for t in trades) / n if n else 0.0), final_equity=eq, trades_list=trades)
     if not quiet:
         print("\n=== RESULTADO BACKTEST ===")
+        print(f"Entrada: {'apertura de la vela siguiente' if p.entry_mode != 'close' else 'cierre de la vela de senal'} | "
+              f"parcial/BE: {'si' if p.use_partial else 'no'}")
         print(f"Operaciones: {n} | Win rate: {res['win_rate']:.1f}% | PF: {res['profit_factor']:.2f} | R medio: {res['avg_r']:.2f}")
         print(f"Neto: {res['net_pct']:.1f}% (capital final {eq:.2f}) | Max drawdown: {max_dd:.1f}%")
         for key in ("side", "reason"):
@@ -451,6 +530,17 @@ def backtest(c0, c1, c2, p: Params, equity0=1000.0, risk_pct=0.5, max_lev=3.0, q
 # ============================================================================
 # Datos y exchange
 # ============================================================================
+def with_retry(fn, *a, tries=3, delay=1.5, **k):
+    """Reintenta SOLO lecturas (nunca ordenes: podrian duplicarse)."""
+    for t in range(tries):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            if t == tries - 1:
+                raise
+            time.sleep(delay * (t + 1))
+
+
 def make_exchange(cfg: dict, with_keys: bool):
     import ccxt  # importacion tardia
     ex_id = cfg.get("exchange", "bingx")
@@ -473,7 +563,7 @@ def fetch_all(ex, symbol, tf, since, tf_ms, limit=1000):
     out: Dict[int, List[float]] = {}
     now = int(time.time() * 1000)
     while since < now:
-        batch = ex.fetch_ohlcv(symbol, tf, since=since, limit=limit)
+        batch = with_retry(ex.fetch_ohlcv, symbol, tf, since=since, limit=limit)
         if not batch:
             break
         for b in batch:
@@ -547,10 +637,12 @@ DEFAULT_CFG: Dict[str, Any] = {
     "max_leverage": 3.0,
     "paper_equity": 1000.0,
     "max_daily_loss_pct": 3.0,
+    "max_drawdown_pct": 15.0,                # desde el maximo de equity: detiene el bot
     "max_consecutive_losses": 3,
     "pause_minutes": 360,
     "hedge_mode": True,
     "sl_tp_mode": "separate",                # separate | attach
+    "verify_orders": True,
     "candles": 1000,
     "loop_delay_sec": 8,
     "data_dir": ".",
@@ -567,17 +659,22 @@ class Bot:
         self.signals_only = cfg["mode"] == "signals"
         self.symbol = cfg["trade_symbol"]
         self.state = self._load_state()
+        self.last_ok_ms = int(time.time() * 1000)
+        self._last_alert: Dict[str, float] = {}
 
+    # ---- estado ----
     def _load_state(self) -> dict:
         path = self.cfg["state_file"]
+        base = dict(day="", day_start_equity=None, paper_equity=self.cfg["paper_equity"], positions={}, last_signal_ts=0,
+                    pause_until_ms=0, consec_losses=0, halt=False, tg_offset=0, peak_equity=None, risk_override=None,
+                    signals_today=0)
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    return json.load(f)
+                    base.update(json.load(f))
             except Exception:
                 log.warning("No se pudo leer %s, se empieza de cero", path)
-        return dict(day="", day_start_equity=None, paper_equity=self.cfg["paper_equity"], positions={},
-                    last_signal_ts=0, pause_until_ms=0, consec_losses=0, halt=False, tg_offset=0)
+        return base
 
     def _save_state(self):
         tmp = self.cfg["state_file"] + ".tmp"
@@ -585,45 +682,64 @@ class Bot:
             json.dump(self.state, f, indent=1)
         os.replace(tmp, self.cfg["state_file"])
 
+    def risk_pct(self) -> float:
+        return float(self.state.get("risk_override") or self.cfg["risk_pct"])
+
+    def _once(self, key: str, text: str, every_s: int = 1800):
+        if time.time() - self._last_alert.get(key, 0) >= every_s:
+            self._last_alert[key] = time.time()
+            notify(text)
+
     def equity(self) -> float:
         if not self.live:
             return float(self.state["paper_equity"])
-        bal = self.ex.fetch_balance()
+        bal = with_retry(self.ex.fetch_balance)
         tot = bal.get("total", {}).get("USDT")
         if tot is None:
             tot = bal.get("USDT", {}).get("total", 0.0)
         return float(tot or 0.0)
 
-    def get_candles(self, now_ms: int):
-        lim = self.cfg["candles"]
+    def get_candles(self):
         res = []
         for s in [self.symbol] + list(self.cfg["triad"]):
-            raw = self.ex.fetch_ohlcv(s, "15m", limit=lim)
-            res.append([[int(x[0])] + [float(y) for y in x[1:6]] for x in raw if int(x[0]) + TF_MS <= now_ms])
+            raw = with_retry(self.ex.fetch_ohlcv, s, "15m", limit=self.cfg["candles"])
+            res.append([[int(x[0])] + [float(y) for y in x[1:6]] for x in raw])
         return res
 
     # ---- ciclo ----
-    def tick(self, now_ms: Optional[int] = None):
+    def tick(self, now_ms: Optional[int] = None) -> str:
         now_ms = now_ms or int(time.time() * 1000)
         day = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-        if self.state["day"] != day:
-            eq_now = self.equity()
-            if self.state["day"] and self.state["day_start_equity"] is not None and not self.signals_only:
-                notify(f"📊 Resumen {self.state['day']}: equity {eq_now:.2f} USDT ({eq_now - self.state['day_start_equity']:+.2f} en el dia)")
-            self.state["day"] = day
-            self.state["day_start_equity"] = eq_now
+        status = "ok"
         try:
-            self.process(now_ms)
+            eq = self.equity()
+            if self.state["day"] != day:
+                if self.state["day"]:
+                    if self.signals_only:
+                        notify(f"📊 Resumen {self.state['day']}: {self.state['signals_today']} senales enviadas · el bot sigue activo")
+                    elif self.state["day_start_equity"] is not None:
+                        notify(f"📊 Resumen {self.state['day']}: equity {eq:.2f} USDT ({eq - self.state['day_start_equity']:+.2f} en el dia)")
+                self.state.update(day=day, day_start_equity=eq, signals_today=0)
+            peak = max(self.state.get("peak_equity") or eq, eq)
+            self.state["peak_equity"] = peak
+            dd = (peak - eq) / peak * 100 if peak > 0 else 0.0
+            if not self.signals_only and dd >= self.cfg["max_drawdown_pct"] and not self.state["halt"]:
+                self.state["halt"] = True
+                notify(f"🛑 Drawdown {dd:.1f}% desde el maximo (limite {self.cfg['max_drawdown_pct']}%). Entradas DETENIDAS. "
+                       f"Revisa y usa /resume para reanudar (reinicia el maximo).")
+            status = self.process(now_ms) or "ok"
         except Exception as e:  # noqa
             log.exception("Error procesando: %s", e)
-            notify(f"⚠️ Error en el ciclo: {e}")
+            self._once("err", f"⚠️ Error en el ciclo: {e}")
+            status = "retry"
         self._save_state()
+        return status
 
     def entries_allowed(self, now_ms: int) -> Optional[str]:
         if os.path.exists("STOP"):
             return "archivo STOP presente"
         if self.state.get("halt"):
-            return "bot detenido con /stop"
+            return "bot detenido (/stop o limite de drawdown)"
         if now_ms < self.state["pause_until_ms"]:
             return "en pausa por perdidas seguidas"
         eq, eq0 = self.equity(), self.state["day_start_equity"] or self.equity()
@@ -633,50 +749,79 @@ class Bot:
             return "ya hay una posicion abierta"
         if self.live:
             try:
-                for q in self.ex.fetch_positions([self.symbol]):
+                for q in with_retry(self.ex.fetch_positions, [self.symbol]):
                     if abs(float(q.get("contracts") or 0)) > 0:
                         return "hay una posicion abierta en el exchange que el bot no gestiona"
             except Exception as e:  # noqa
                 return f"no se pudo comprobar posiciones ({e})"
         return None
 
-    def process(self, now_ms: int):
-        c0, c1, c2 = self.get_candles(now_ms)
-        if len(c0) < 300 or len(c1) < 300 or len(c2) < 300:
-            log.warning("Pocas velas (%d/%d/%d)", len(c0), len(c1), len(c2))
-            return
+    def pre_entry_checks(self, sig: dict) -> Optional[str]:
+        """Solo en vivo: spread, precio ya alejado del plan, precio fuera de SL/TP."""
+        t = with_retry(self.ex.fetch_ticker, self.symbol)
+        bid, ask, last = t.get("bid"), t.get("ask"), t.get("last")
+        if bid and ask and bid > 0:
+            spread = (ask - bid) / ((ask + bid) / 2) * 100
+            if spread > self.p.max_spread_pct:
+                return f"spread {spread:.3f}% > {self.p.max_spread_pct}%"
+        dr = 1 if sig["side"] == "long" else -1
+        px = (ask if dr == 1 else bid) or last
+        if not px:
+            return "sin precio actual"
+        risk = abs(sig["entry"] - sig["sl"])
+        if (px - sig["entry"]) * dr > self.p.max_chase_frac * risk:
+            return f"el precio ya se alejo {abs(px - sig['entry']) / risk * 100:.0f}% del riesgo (max {self.p.max_chase_frac * 100:.0f}%)"
+        if (dr == 1 and not (sig["sl"] < px < sig["tp"])) or (dr == -1 and not (sig["tp"] < px < sig["sl"])):
+            return "el precio ya esta fuera del rango SL-TP"
+        return None
+
+    def process(self, now_ms: int) -> str:
+        c0, c1, c2 = self.get_candles()
+        expected = (now_ms // TF_MS) * TF_MS - TF_MS          # apertura de la ultima vela cerrada
+        c0, c1, c2 = ([x for x in c if x[0] + TF_MS <= now_ms] for c in (c0, c1, c2))
+        if min(len(c0), len(c1), len(c2)) < 300:
+            self._once("few", f"⚠️ Pocas velas ({len(c0)}/{len(c1)}/{len(c2)})")
+            return "retry"
+        if not (c0[-1][0] == c1[-1][0] == c2[-1][0] == expected):
+            return "retry"           # aun no esta publicada la ultima vela (o falta un activo de la triada)
+        self.last_ok_ms = now_ms
         if self.symbol in self.state["positions"] and not self.signals_only:
             self.manage(c0)
         sig = compute_signals(c0, c1, c2, self.p)[-1]
         if not sig or sig["ts"] != c0[-1][0] or self.state["last_signal_ts"] == sig["ts"]:
-            return
+            return "ok"
         self.state["last_signal_ts"] = sig["ts"]
+        self.state["signals_today"] = self.state.get("signals_today", 0) + 1
         if self.signals_only:
-            notify(signal_text(self.symbol, sig, float(self.cfg["paper_equity"]), self.cfg["risk_pct"], self.cfg["max_leverage"]))
-            return
+            notify(signal_text(self.symbol, sig, float(self.cfg["paper_equity"]), self.risk_pct(), self.cfg["max_leverage"]))
+            return "ok"
         why = self.entries_allowed(now_ms)
+        if not why and self.live:
+            why = self.pre_entry_checks(sig)
         if why:
-            notify(f"⏭ Senal {sig['side'].upper()} IGNORADA ({why})\n{signal_text(self.symbol, sig, self.equity(), self.cfg['risk_pct'], self.cfg['max_leverage'])}")
-            return
+            notify(f"⏭ Senal {sig['side'].upper()} IGNORADA ({why})\n"
+                   f"{signal_text(self.symbol, sig, self.equity(), self.risk_pct(), self.cfg['max_leverage'])}")
+            return "ok"
         self.open_position(sig, c0[-1][0])
+        return "ok"
 
     # ---- apertura ----
     def open_position(self, sig: dict, bar_ts: int):
         eq = self.equity()
         dr = 1 if sig["side"] == "long" else -1
         entry = sig["entry"] * (1 + self.p.slippage_pct / 100.0 * dr)
-        qty = position_size(eq, self.cfg["risk_pct"], self.cfg["max_leverage"], entry, sig["sl"])
+        qty = position_size(eq, self.risk_pct(), self.cfg["max_leverage"], entry, sig["sl"])
         if qty <= 0:
             return
-        pos = dict(side=sig["side"], entry=entry, sl=sig["sl"], tp=sig["tp"], qty=qty, bar_ts=bar_ts, checked_ts=bar_ts,
-                   equity_at_entry=eq, risk_cash=eq * self.cfg["risk_pct"] / 100.0)
+        pos = new_position(sig["side"], entry, sig["sl"], sig["tp"], qty, eq * self.risk_pct() / 100.0, bar_ts, 0, self.p)
+        pos.update(bar_ts=bar_ts, checked_ts=bar_ts, equity_at_entry=eq)
         if self.live:
             ok, pos = self._live_entry(sig, pos)
             if not ok:
                 return
         self.state["positions"][self.symbol] = pos
         notify(("💰 [LIVE] ENTRADA EJECUTADA\n" if self.live else "🧪 [PAPER] entrada simulada\n")
-               + signal_text(self.symbol, dict(sig, entry=pos["entry"]), eq, self.cfg["risk_pct"], self.cfg["max_leverage"]))
+               + signal_text(self.symbol, dict(sig, entry=pos["entry"]), eq, self.risk_pct(), self.cfg["max_leverage"]))
 
     def _side_params(self, side: str, closing: bool = False) -> dict:
         prm: Dict[str, Any] = {}
@@ -719,10 +864,7 @@ class Bot:
                 ex.create_order(symbol, "market", opp, amount, None, dict(cprm, stopLossPrice=sl_px))
             except Exception as e:  # noqa
                 notify(f"❌ {symbol}: no se pudo colocar el SL ({e}). Cierro la posicion por seguridad.")
-                try:
-                    self._close_market(pos, amount)
-                except Exception as e2:  # noqa
-                    notify(f"🚨 {symbol}: NO SE PUDO CERRAR. REVISA EL EXCHANGE YA. ({e2})")
+                self._emergency_close(pos, amount)
                 return False, pos
             try:
                 ex.create_order(symbol, "market", opp, amount, None, dict(cprm, takeProfitPrice=tp_px))
@@ -731,8 +873,26 @@ class Bot:
         fill = order.get("average") or order.get("price")
         if fill:
             pos["entry"] = float(fill)
+            risk = abs(sig["entry"] - sig["sl"])
+            if (pos["entry"] - sig["entry"]) * (1 if sig["side"] == "long" else -1) > self.p.max_slip_frac * risk:
+                notify(f"⚠️ {symbol}: slippage excesivo (entrada {fmt_px(pos['entry'])} vs plan {fmt_px(sig['entry'])}). Cierro.")
+                self._emergency_close(pos, amount)
+                return False, pos
         pos.update(amount=amount, sl=sl_px, tp=tp_px)
+        if self.cfg.get("verify_orders", True):
+            try:
+                if not with_retry(ex.fetch_open_orders, symbol):
+                    notify("⚠️ No veo ordenes SL/TP abiertas por API. Comprueba en BingX que la posicion tiene SL "
+                           "(si BingX no las lista por API, ignora este aviso).")
+            except Exception:
+                pass
         return True, pos
+
+    def _emergency_close(self, pos: dict, amount: float):
+        try:
+            self._close_market(pos, amount)
+        except Exception as e2:  # noqa
+            notify(f"🚨 {self.symbol}: NO SE PUDO CERRAR. REVISA EL EXCHANGE YA. ({e2})")
 
     def _close_market(self, pos: dict, amount: Optional[float] = None):
         opp = "sell" if pos["side"] == "long" else "buy"
@@ -746,30 +906,19 @@ class Bot:
     # ---- gestion ----
     def manage(self, c0: List[List[float]]):
         pos = self.state["positions"][self.symbol]
-        dr = 1 if pos["side"] == "long" else -1
-        slip = self.p.slippage_pct / 100.0
         if self.live:
             return self._manage_live(pos, c0)
         for c in [x for x in c0 if x[0] > pos["checked_ts"]]:
-            ts, o, h, l, cl, v = c
-            pos["checked_ts"] = ts
-            ex_px = reason = None
-            if (dr == 1 and l <= pos["sl"]) or (dr == -1 and h >= pos["sl"]):
-                ex_px, reason = pos["sl"] * (1 - slip * dr), "SL"
-            elif (dr == 1 and h >= pos["tp"]) or (dr == -1 and l <= pos["tp"]):
-                ex_px, reason = pos["tp"], "TP"
-            elif self.p.max_bars > 0 and (ts - pos["bar_ts"]) // TF_MS >= self.p.max_bars:
-                ex_px, reason = cl * (1 - slip * dr), "TIME"
-            if ex_px is not None:
-                fee = self.p.fee_pct / 100.0
-                pnl = (ex_px - pos["entry"]) * dr * pos["qty"] - pos["qty"] * (pos["entry"] + ex_px) * fee
-                self.state["paper_equity"] += pnl
-                self._record_close(pos, ex_px, reason, pnl, ts)
+            pos["checked_ts"] = c[0]
+            res = advance(pos, c, (c[0] - pos["bar_ts"]) // TF_MS, self.p)
+            if res:
+                self.state["paper_equity"] += res["pnl"]
+                self._record_close(pos, res["exit"], res["reason"], res["pnl"], c[0])
                 return
 
     def _manage_live(self, pos: dict, c0):
         try:
-            plist = self.ex.fetch_positions([self.symbol])
+            plist = with_retry(self.ex.fetch_positions, [self.symbol])
         except Exception as e:  # noqa
             log.warning("fetch_positions fallo: %s", e)
             return
@@ -792,7 +941,7 @@ class Bot:
 
     def _record_close(self, pos: dict, exit_px, reason: str, pnl: float, ts: int):
         r = pnl / pos["risk_cash"] if pos["risk_cash"] else 0.0
-        del self.state["positions"][self.symbol]
+        self.state["positions"].pop(self.symbol, None)
         self.state["consec_losses"] = self.state["consec_losses"] + 1 if pnl < -0.3 * pos["risk_cash"] else 0
         if self.state["consec_losses"] >= self.cfg["max_consecutive_losses"]:
             self.state["pause_until_ms"] = ts + self.cfg["pause_minutes"] * 60_000
@@ -807,12 +956,43 @@ class Bot:
             w.writerow([ts, self.symbol, pos["side"], pos["entry"], exit_px, reason, round(pnl, 6), round(r, 3)])
 
     # ---- Telegram ----
+    def read_trades(self) -> List[dict]:
+        path = self.cfg["trades_log"]
+        if not os.path.exists(path):
+            return []
+        with open(path, newline="") as f:
+            return list(csv.DictReader(f))
+
+    def pnl_text(self) -> str:
+        rows = self.read_trades()
+        now = datetime.now(timezone.utc)
+        day0 = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        wk0 = int(now.timestamp() * 1000) - 7 * 86400_000
+
+        def agg(rs):
+            n = len(rs)
+            pnl = sum(float(r["pnl"]) for r in rs)
+            w = sum(1 for r in rs if float(r["pnl"]) > 0)
+            return f"{n} ops · {pnl:+.2f} USDT · win {w / n * 100:.0f}%" if n else "0 ops"
+        return (f"PnL (modo {self.cfg['mode']})\nHoy: {agg([r for r in rows if int(r['ts']) >= day0])}\n"
+                f"7 dias: {agg([r for r in rows if int(r['ts']) >= wk0])}\nTotal: {agg(rows)}")
+
+    def trades_text(self) -> str:
+        rows = self.read_trades()[-5:]
+        if not rows:
+            return "Sin operaciones cerradas todavia"
+        return "Ultimas operaciones:\n" + "\n".join(
+            f"{datetime.fromtimestamp(int(r['ts']) / 1000, tz=timezone.utc).strftime('%d/%m %H:%M')} {r['side']} {r['reason']} {float(r['pnl']):+.2f} ({r['r']}R)"
+            for r in rows)
+
     def status_text(self) -> str:
         eq = self.equity()
         eq0 = self.state.get("day_start_equity") or eq
+        peak = self.state.get("peak_equity") or eq
         lines = [f"Bot QS-SSMT · modo {self.cfg['mode']} · {self.cfg['exchange']}",
                  f"Opera: {self.symbol} | triada: {', '.join(self.cfg['triad'])}",
-                 f"Equity: {eq:.2f} USDT ({eq - eq0:+.2f} hoy)",
+                 f"Equity: {eq:.2f} USDT ({eq - eq0:+.2f} hoy) · DD actual {(peak - eq) / peak * 100 if peak else 0:.1f}%",
+                 f"Riesgo/op: {self.risk_pct()}% · apal. max {self.cfg['max_leverage']}x",
                  f"Estado: {'⏸ DETENIDO (/resume)' if self.state.get('halt') else '▶️ activo'}"]
         if self.state["pause_until_ms"] > time.time() * 1000:
             lines.append("Pausa activa por perdidas seguidas")
@@ -821,6 +1001,24 @@ class Bot:
         if not self.state["positions"]:
             lines.append("Sin posiciones abiertas")
         return "\n".join(lines)
+
+    def manual_close(self) -> str:
+        pos = self.state["positions"].get(self.symbol)
+        if not pos:
+            return "No hay posicion abierta."
+        if self.live:
+            try:
+                self._close_market(pos)
+                return "Cierre a mercado enviado. Se registrara en el proximo ciclo."
+            except Exception as e:  # noqa
+                return f"❌ No se pudo cerrar: {e}"
+        px = float(with_retry(self.ex.fetch_ohlcv, self.symbol, "15m", limit=2)[-1][4])
+        dr = 1 if pos["side"] == "long" else -1
+        px *= 1 - self.p.slippage_pct / 100.0 * dr
+        pnl = pos["realized"] + close_pnl(pos, px, self.p.fee_pct / 100.0)
+        self.state["paper_equity"] += pnl
+        self._record_close(pos, px, "MANUAL", pnl, int(time.time() * 1000))
+        return "Posicion paper cerrada."
 
     def poll_telegram(self):
         chat = os.environ.get("TELEGRAM_CHAT_ID")
@@ -832,29 +1030,57 @@ class Bot:
             if str(msg.get("chat", {}).get("id")) != str(chat):
                 continue
             txt = (msg.get("text") or "").strip().lower()
-            if txt.startswith("/status"):
+            cmd = txt.split()[0] if txt else ""
+            if cmd == "/status":
                 notify(self.status_text())
-            elif txt.startswith("/stop"):
+            elif cmd == "/pnl":
+                notify(self.pnl_text())
+            elif cmd == "/trades":
+                notify(self.trades_text())
+            elif cmd == "/stop":
                 self.state["halt"] = True
                 notify("⏸ Entradas detenidas. Las posiciones abiertas siguen con su SL/TP. /resume para reanudar.")
-            elif txt.startswith("/resume"):
+            elif cmd == "/resume":
                 self.state["halt"] = False
-                notify("▶️ Entradas reanudadas.")
-            elif txt.startswith("/help") or txt.startswith("/start"):
-                notify("Comandos: /status  /stop  /resume")
+                self.state["peak_equity"] = self.equity()
+                notify("▶️ Entradas reanudadas (el maximo de equity se reinicia).")
+            elif cmd == "/close":
+                notify(self.manual_close())
+            elif cmd == "/risk":
+                try:
+                    v = float(txt.split()[1])
+                    if not 0.05 <= v <= 2.0:
+                        raise ValueError
+                    self.state["risk_override"] = v
+                    notify(f"Riesgo por operacion = {v}%")
+                except Exception:
+                    notify("Uso: /risk 0.5   (entre 0.05 y 2.0)")
+            elif cmd in ("/help", "/start"):
+                notify("Comandos: /status /pnl /trades /close /risk X /stop /resume")
         if changed:
             self._save_state()
 
     def run_forever(self):
         notify(f"🤖 Bot QS-SSMT iniciado · modo {self.cfg['mode']} · {self.cfg['exchange']}\n"
                f"Opera {self.symbol} (triada {', '.join(self.cfg['triad'])})\n"
-               f"Riesgo {self.cfg['risk_pct']}% · apal. max {self.cfg['max_leverage']}x\nComandos: /status /stop /resume")
+               f"Riesgo {self.risk_pct()}% · apal. max {self.cfg['max_leverage']}x\n"
+               f"Comandos: /status /pnl /trades /close /risk X /stop /resume")
+        if self.live and self.state["positions"]:
+            notify(f"♻️ Reanudo con posicion abierta guardada: {list(self.state['positions'])}")
         step = TF_MS // 1000
         next_tick = (int(time.time() // step) + 1) * step + self.cfg["loop_delay_sec"]
+        retries = 0
         while True:
             if time.time() >= next_tick:
-                self.tick()
-                next_tick = (int(time.time() // step) + 1) * step + self.cfg["loop_delay_sec"]
+                status = self.tick()
+                if status == "retry" and retries < 8:
+                    retries += 1
+                    next_tick = time.time() + 10          # la vela aun no esta publicada: reintento corto
+                else:
+                    retries = 0
+                    next_tick = (int(time.time() // step) + 1) * step + self.cfg["loop_delay_sec"]
+            if time.time() * 1000 - self.last_ok_ms > 3 * TF_MS:
+                self._once("watchdog", f"⚠️ Sin ciclos correctos desde hace {(time.time() * 1000 - self.last_ok_ms) / 60000:.0f} min", 3600)
             try:
                 self.poll_telegram()
             except Exception as e:  # noqa
@@ -887,6 +1113,7 @@ def load_cfg(path: Optional[str]) -> dict:
         cfg["triad"] = [x.strip() for x in env["BOT_TRIAD"].split(",") if x.strip()]
     for key, ek, cast in (("risk_pct", "BOT_RISK_PCT", float), ("max_leverage", "BOT_LEVERAGE", float),
                           ("paper_equity", "BOT_PAPER_EQUITY", float), ("max_daily_loss_pct", "BOT_MAX_DAILY_LOSS", float),
+                          ("max_drawdown_pct", "BOT_MAX_DRAWDOWN", float),
                           ("max_consecutive_losses", "BOT_MAX_CONSEC_LOSSES", int), ("pause_minutes", "BOT_PAUSE_MINUTES", int)):
         if env.get(ek):
             cfg[key] = cast(env[ek])
@@ -894,6 +1121,8 @@ def load_cfg(path: Optional[str]) -> dict:
         cfg["hedge_mode"] = _env_bool(env["BOT_HEDGE"])
     if env.get("BOT_TESTNET"):
         cfg["testnet"] = _env_bool(env["BOT_TESTNET"])
+    if env.get("BOT_VERIFY_ORDERS"):
+        cfg["verify_orders"] = _env_bool(env["BOT_VERIFY_ORDERS"])
     if env.get("BOT_SL_TP_MODE"):
         cfg["sl_tp_mode"] = env["BOT_SL_TP_MODE"].strip().lower()
     if env.get("BOT_PARAMS"):
@@ -916,22 +1145,35 @@ def make_params(cfg: dict) -> Params:
     return Params(**cfg.get("params", {}))
 
 
+def load_history(cfg: dict, days: int):
+    ex = make_exchange(cfg, with_keys=False)
+    since = int((time.time() - (days + 10) * 86400) * 1000)
+    data = []
+    for s in [cfg["trade_symbol"]] + cfg["triad"]:
+        print(f"Descargando {s} 15m ({days}+10 dias) de {cfg['exchange']} ...")
+        data.append(fetch_all(ex, s, "15m", since, TF_MS))
+    return data
+
+
 def cmd_backtest(args):
     cfg = load_cfg(args.config)
     p = make_params(cfg)
-    ex = make_exchange(cfg, with_keys=False)
-    since = int((time.time() - (args.days + 10) * 86400) * 1000)
-    data = []
-    for s in [cfg["trade_symbol"]] + cfg["triad"]:
-        print(f"Descargando {s} 15m ({args.days}+10 dias) de {cfg['exchange']} ...")
-        data.append(fetch_all(ex, s, "15m", since, TF_MS))
-    res = backtest(data[0], data[1], data[2], p, equity0=args.equity, risk_pct=cfg["risk_pct"], max_lev=cfg["max_leverage"])
+    c0, c1, c2 = load_history(cfg, args.days)
+    res = backtest(c0, c1, c2, p, equity0=args.equity, risk_pct=cfg["risk_pct"], max_lev=cfg["max_leverage"])
     if args.out and res["trades_list"]:
         with open(args.out, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(res["trades_list"][0].keys()))
             w.writeheader()
             w.writerows(res["trades_list"])
         print(f"Operaciones guardadas en {args.out}")
+
+
+def cmd_research(args):
+    import research
+    cfg = load_cfg(args.config)
+    p = make_params(cfg)
+    c0, c1, c2 = load_history(cfg, args.days)
+    research.run_report(c0, c1, c2, p, equity=args.equity, risk_pct=cfg["risk_pct"], max_lev=cfg["max_leverage"], folds=args.folds)
 
 
 def cmd_markets(args):
@@ -949,6 +1191,8 @@ def cmd_run(args, mode: Optional[str] = None):
     if mode not in ("signals", "paper", "live"):
         raise SystemExit(f"Modo desconocido: {mode}")
     p = make_params(cfg)
+    if mode == "live" and p.use_partial:
+        raise SystemExit("use_partial (parcial/BE) solo esta soportado en backtest y paper, no en live.")
     if mode == "live" and not (getattr(args, "yes", False) or os.environ.get("BOT_CONFIRM_LIVE", "").upper() == "YES"):
         raise SystemExit("Modo live: define BOT_CONFIRM_LIVE=YES tras probar backtest y paper.")
     ex = make_exchange(cfg, with_keys=(mode == "live"))
@@ -975,6 +1219,11 @@ def main():
     b.add_argument("--days", type=int, default=90)
     b.add_argument("--equity", type=float, default=1000.0)
     b.add_argument("--out")
+    r = sub.add_parser("research", help="ablacion de filtros, walk-forward, intervalo de confianza y Monte Carlo")
+    r.add_argument("--config", default="config.json")
+    r.add_argument("--days", type=int, default=180)
+    r.add_argument("--folds", type=int, default=4)
+    r.add_argument("--equity", type=float, default=1000.0)
     m = sub.add_parser("markets")
     m.add_argument("--exchange", default="bingx")
     m.add_argument("--filter", default="")
@@ -986,6 +1235,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
     if args.cmd == "backtest":
         cmd_backtest(args)
+    elif args.cmd == "research":
+        cmd_research(args)
     elif args.cmd == "markets":
         cmd_markets(args)
     else:

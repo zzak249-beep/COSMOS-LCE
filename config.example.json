@@ -1,0 +1,23 @@
+{
+  "exchange": "bingx",
+  "testnet": true,
+  "symbols": ["BULL/USDT:USDT"],
+  "risk_pct": 0.75,
+  "max_leverage": 3.0,
+  "paper_equity": 1000.0,
+  "max_open_positions": 2,
+  "max_daily_loss_pct": 3.0,
+  "max_consecutive_losses": 3,
+  "pause_minutes": 180,
+  "hedge_mode": true,
+  "sl_tp_mode": "separate",
+  "params": {
+    "min_grade": "A+B",
+    "max_touch_sig": 3,
+    "use_bo": true,
+    "use_rv": true,
+    "max_bars": 48,
+    "fee_pct": 0.05,
+    "slippage_pct": 0.03
+  }
+}
